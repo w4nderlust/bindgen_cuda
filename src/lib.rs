@@ -532,6 +532,66 @@ fn gencode_args(caps: &[usize]) -> Vec<String> {
     args
 }
 
+/// Detect GPU compute capability via the CUDA driver API.
+///
+/// Dynamically loads `libcuda.so.1` (Linux) or `nvcuda.dll` (Windows) and queries
+/// the first GPU's compute capability using `cuInit` + `cuDeviceGetAttribute`.
+/// This is the same approach as `cuda-diagnostic::probe_device`, without the
+/// heavy candle-core dependency.
+///
+/// Returns `None` if the driver can't be loaded or the query fails (e.g., no GPU,
+/// CI without driver, cross-compilation).
+fn detect_cc_from_cuda_driver() -> Option<usize> {
+    // CUDA driver API constants
+    const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR: i32 = 75;
+    const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR: i32 = 76;
+    const CUDA_SUCCESS: i32 = 0;
+
+    let lib_name = if cfg!(target_os = "windows") {
+        "nvcuda.dll"
+    } else {
+        "libcuda.so.1"
+    };
+
+    type CuInit = unsafe extern "C" fn(u32) -> i32;
+    type CuDeviceGet = unsafe extern "C" fn(*mut i32, i32) -> i32;
+    type CuDeviceGetAttribute = unsafe extern "C" fn(*mut i32, i32, i32) -> i32;
+
+    unsafe {
+        let lib = libloading::Library::new(lib_name).ok()?;
+        let cu_init: libloading::Symbol<CuInit> = lib.get(b"cuInit").ok()?;
+        if cu_init(0) != CUDA_SUCCESS {
+            return None;
+        }
+        let cu_device_get: libloading::Symbol<CuDeviceGet> = lib.get(b"cuDeviceGet").ok()?;
+        let mut dev: i32 = 0;
+        if cu_device_get(&mut dev, 0) != CUDA_SUCCESS {
+            return None;
+        }
+        let cu_attr: libloading::Symbol<CuDeviceGetAttribute> =
+            lib.get(b"cuDeviceGetAttribute").ok()?;
+        let mut major: i32 = 0;
+        let mut minor: i32 = 0;
+        if cu_attr(
+            &mut major,
+            CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+            dev,
+        ) != CUDA_SUCCESS
+        {
+            return None;
+        }
+        if cu_attr(
+            &mut minor,
+            CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+            dev,
+        ) != CUDA_SUCCESS
+        {
+            return None;
+        }
+        Some((major * 10 + minor) as usize)
+    }
+}
+
 fn cuda_include_dir() -> Option<PathBuf> {
     // NOTE: copied from cudarc build.rs.
     let env_vars = [
@@ -665,20 +725,16 @@ fn compute_cap() -> Result<usize, Error> {
             .parse::<usize>()
             .expect("Could not parse code")
     } else {
-        // Use nvidia-smi to get the current compute cap
-        let out = std::process::Command::new("nvidia-smi")
-                .arg("--query-gpu=compute_cap")
-                .arg("--format=csv")
-                .output()
-                .expect("`nvidia-smi` failed. Ensure that you have CUDA installed and that `nvidia-smi` is in your PATH.");
-        let out = std::str::from_utf8(&out.stdout).expect("stdout is not a utf8 string");
-        let mut lines = out.lines();
-        assert_eq!(lines.next().expect("missing line in stdout"), "compute_cap");
-        let cap = lines
-            .next()
-            .expect("missing line in stdout")
-            .replace('.', "");
-        let cap = cap.parse::<usize>().expect("cannot parse as int {cap}");
+        // Auto-detect via CUDA driver API (same as cuda-diagnostic).
+        // Dynamically loads libcuda/nvcuda.dll and queries compute capability
+        // directly from the GPU — no nvidia-smi dependency.
+        let cap = detect_cc_from_cuda_driver().unwrap_or_else(|| {
+            println!(
+                "cargo:warning=Could not auto-detect CUDA compute capability from driver. \
+                 Defaulting to sm_80 (Ampere). Set CUDA_COMPUTE_CAP for Turing (75) GPUs."
+            );
+            80
+        });
         println!("cargo:rustc-env=CUDA_COMPUTE_CAP={cap}");
         cap
     };
